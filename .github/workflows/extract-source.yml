@@ -4,8 +4,10 @@ name: Extract InkVoice AI Source
 on:
   workflow_dispatch:
 
+
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   extract:
