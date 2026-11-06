@@ -1,13 +1,10 @@
-
 name: Extract InkVoice AI Source
 
 on:
   workflow_dispatch:
 
-
 permissions:
   contents: write
-  
 
 jobs:
   extract:
@@ -21,6 +18,7 @@ jobs:
         run: |
           mkdir extracted
           unzip -o InkVoice-AI-Android-Source.zip -d extracted
+          rm -rf extracted/.github
           cp -R extracted/. .
           rm -rf extracted
 
