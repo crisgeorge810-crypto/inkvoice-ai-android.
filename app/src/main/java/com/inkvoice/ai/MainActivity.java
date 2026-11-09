@@ -1,8 +1,9 @@
-
 package com.inkvoice.ai;
 
 import android.app.Activity;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.Manifest;
 import android.content.pm.PackageManager;
 import android.content.Intent;
@@ -19,7 +20,7 @@ import android.widget.*;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.text.TextUtils;
+
 import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.*;
@@ -41,12 +42,24 @@ public class MainActivity extends Activity {
     private EditText topicInput, notesInput;
     private TextView status, pen;
     private LinearLayout content;
+
     private MediaRecorder recorder;
     private MediaPlayer player;
     private SpeechRecognizer speechRecognizer;
+    private File currentAudio;
+
     private boolean recording = false;
     private boolean lightTheme = false;
-    private File currentAudio;
+    private boolean listening = false;
+
+    // Text already confirmed by speech recognition and the current changing phrase.
+    private String speechBaseText = "";
+    private String latestPartial = "";
+
+    private final Handler speechHandler = new Handler(Looper.getMainLooper());
+    private Runnable restartSpeechRunnable;
+    private int consecutiveSpeechErrors = 0;
+
     private android.content.SharedPreferences prefs;
 
     @Override
@@ -136,7 +149,6 @@ public class MainActivity extends Activity {
 
     private void startPage(String title) {
         stopSpeech();
-
         page = title;
 
         ScrollView scroll = new ScrollView(this);
@@ -195,7 +207,6 @@ public class MainActivity extends Activity {
             () -> openNotebook("Church Mode"));
 
         content.addView(space(10));
-
         content.addView(text("YOUR WORKSPACE", 13, GOLD, true));
 
         addCard(content, "▤  My Notebooks",
@@ -251,13 +262,7 @@ public class MainActivity extends Activity {
         topicInput.setPadding(dp(12), dp(10), dp(12), dp(10));
         content.addView(topicInput);
 
-        addButton(content, "+ New topic", () -> {
-            if (notesInput != null) {
-                notesInput.append("\n\n— NEW TOPIC —\n");
-            }
-            topicInput.setText("");
-            topicInput.requestFocus();
-        });
+        addButton(content, "+ New topic", () -> createNewTopic());
 
         notesInput = new EditText(this);
         notesInput.setMinLines(9);
@@ -296,15 +301,36 @@ public class MainActivity extends Activity {
 
         addButton(content, "View saved recordings",
             () -> showRecordings());
+
+        content.addView(text(
+            "Note: Android phones may not allow speech recognition and a separate recorder "
+            + "to use the microphone at the same time. We will test this on your phone.",
+            12, GREY, false));
+    }
+
+    private void createNewTopic() {
+        if (notesInput != null) {
+            String current = notesInput.getText().toString();
+            String marker = (current.isEmpty() ? "" : "\n\n")
+                    + "— NEW TOPIC —\n";
+            notesInput.append(marker);
+            if (listening) {
+                speechBaseText = notesInput.getText().toString();
+                latestPartial = "";
+            }
+        }
+        if (topicInput != null) {
+            topicInput.setText("");
+            topicInput.requestFocus();
+        }
+        if (status != null) status.setText("New topic started");
     }
 
     private void showNotebooks() {
         startPage("My Notebooks");
-
         content.addView(text(
             "Your saved notebook entries are stored on this phone.",
             14, GREY, false));
-
         showSavedNotes(content);
     }
 
@@ -369,10 +395,7 @@ public class MainActivity extends Activity {
 
     private void showAssistant() {
         startPage("AI Writing Assistant");
-
-        content.addView(text(
-            "Writing workspace",
-            19, GOLD, true));
+        content.addView(text("Writing workspace", 19, GOLD, true));
 
         EditText writing = new EditText(this);
         writing.setMinLines(8);
@@ -384,16 +407,15 @@ public class MainActivity extends Activity {
         writing.setPadding(dp(12), dp(12), dp(12), dp(12));
         content.addView(writing);
 
-        addButton(content, "Copy text",
-            () -> {
-                android.content.ClipboardManager clipboard =
-                    (android.content.ClipboardManager)
-                    getSystemService(CLIPBOARD_SERVICE);
-                clipboard.setPrimaryClip(
-                    android.content.ClipData.newPlainText(
-                        "InkVoice text", writing.getText().toString()));
-                toast("Text copied");
-            });
+        addButton(content, "Copy text", () -> {
+            android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager)
+                getSystemService(CLIPBOARD_SERVICE);
+            clipboard.setPrimaryClip(
+                android.content.ClipData.newPlainText(
+                    "InkVoice text", writing.getText().toString()));
+            toast("Text copied");
+        });
 
         content.addView(text(
             "AI rewriting and summarising will be added in a later development stage.",
@@ -402,7 +424,6 @@ public class MainActivity extends Activity {
 
     private void showSettings() {
         startPage("Settings");
-
         content.addView(text("Appearance", 18, GOLD, true));
 
         addButton(content,
@@ -423,6 +444,11 @@ public class MainActivity extends Activity {
     }
 
     private void startSpeech() {
+        if (notesInput == null) {
+            toast("Open a notebook first");
+            return;
+        }
+
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(
@@ -432,89 +458,205 @@ public class MainActivity extends Activity {
 
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             status.setText("Speech recognition unavailable");
+            toast("Please check that Android speech recognition is installed");
             return;
         }
 
         stopSpeech();
 
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        speechBaseText = notesInput.getText().toString();
+        latestPartial = "";
+        consecutiveSpeechErrors = 0;
+        listening = true;
 
-        speechRecognizer.setRecognitionListener(
-            new RecognitionListener() {
+        try {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            speechRecognizer.setRecognitionListener(new RecognitionListener() {
+                @Override
                 public void onReadyForSpeech(Bundle b) {
-                    status.setText("Listening • " + mode);
+                    if (status != null) status.setText("Listening • " + mode);
                     animatePen();
                 }
 
+                @Override
                 public void onBeginningOfSpeech() {
-                    pen.setText("✒  Writing as you speak...");
+                    if (pen != null) pen.setText("✒  Writing as you speak...");
                 }
 
-                public void onRmsChanged(float r) {}
-                public void onBufferReceived(byte[] b) {}
+                @Override public void onRmsChanged(float r) {}
+                @Override public void onBufferReceived(byte[] b) {}
 
+                @Override
                 public void onEndOfSpeech() {
-                    status.setText("Processing speech...");
+                    if (status != null) status.setText("Processing speech...");
                 }
 
-                public void onError(int e) {
-                    status.setText("Speech service error " + e
-                        + ". Check your speech service and try again.");
-                    pen.clearAnimation();
-                    pen.setText("✒  AI pen ready");
+                @Override
+                public void onError(int error) {
+                    if (!listening) return;
+
+                    if (pen != null) {
+                        pen.clearAnimation();
+                        pen.setText("✒  Waiting for speech...");
+                    }
+
+                    // These errors commonly occur between spoken phrases.
+                    if (error == SpeechRecognizer.ERROR_NO_MATCH
+                            || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                            || error == SpeechRecognizer.ERROR_NETWORK
+                            || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+                            || error == SpeechRecognizer.ERROR_SERVER
+                            || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                            || error == SpeechRecognizer.ERROR_CLIENT) {
+                        consecutiveSpeechErrors++;
+                        if (status != null) {
+                            status.setText("No clear speech detected. Listening again...");
+                        }
+                        scheduleSpeechRestart(consecutiveSpeechErrors > 3 ? 2200 : 1000);
+                    } else {
+                        listening = false;
+                        if (status != null) {
+                            status.setText("Speech stopped (error " + error + ").");
+                        }
+                        if (pen != null) pen.setText("✒  AI pen ready");
+                    }
                 }
 
+                @Override
                 public void onResults(Bundle b) {
-                    appendResults(b);
-                    status.setText("Transcription received");
-                    pen.clearAnimation();
-                    pen.setText("✒  AI pen ready");
+                    if (!listening) return;
+                    consecutiveSpeechErrors = 0;
+                    commitSpeechResult(b);
+                    if (status != null) status.setText("Listening • " + mode);
+                    scheduleSpeechRestart(650);
                 }
 
+                @Override
                 public void onPartialResults(Bundle b) {
-                    appendResults(b);
+                    if (!listening) return;
+                    showPartialResult(b);
                 }
 
-                public void onEvent(int t, Bundle b) {}
+                @Override public void onEvent(int t, Bundle b) {}
             });
 
+            startListeningRequest();
+
+        } catch (Exception e) {
+            listening = false;
+            status.setText("Could not start speech recognition");
+            toast("Speech recognition could not start: " + e.getMessage());
+        }
+    }
+
+    private Intent createSpeechIntent() {
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
             RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
-
-        // Do not force offline recognition.
-        // Let Android use its available speech recognition service.
-        speechRecognizer.startListening(i);
+        return i;
     }
 
-    private void appendResults(Bundle b) {
+    private void startListeningRequest() {
+        if (!listening || speechRecognizer == null) return;
+
+        try {
+            speechRecognizer.startListening(createSpeechIntent());
+        } catch (Exception e) {
+            scheduleSpeechRestart(1800);
+        }
+    }
+
+    private void scheduleSpeechRestart(long delayMs) {
+        if (!listening) return;
+
+        if (restartSpeechRunnable != null) {
+            speechHandler.removeCallbacks(restartSpeechRunnable);
+        }
+
+        restartSpeechRunnable = () -> {
+            restartSpeechRunnable = null;
+            startListeningRequest();
+        };
+
+        speechHandler.postDelayed(restartSpeechRunnable, delayMs);
+    }
+
+    private String getRecognizedPhrase(Bundle b) {
+        if (b == null) return "";
         ArrayList<String> results =
             b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
 
-        if (results == null || results.isEmpty() || notesInput == null)
-            return;
+        if (results == null || results.isEmpty() || results.get(0) == null)
+            return "";
 
-        String phrase = results.get(0);
+        return results.get(0).trim();
+    }
 
-        if (phrase.equalsIgnoreCase("new topic")) {
-            topicInput.setText("");
-            notesInput.append("\n\n— NEW TOPIC —\n");
-            status.setText("New topic detected");
+    private void showPartialResult(Bundle b) {
+        String phrase = getRecognizedPhrase(b);
+        if (phrase.isEmpty() || notesInput == null) return;
+
+        latestPartial = phrase;
+        String display = speechBaseText;
+        if (!display.isEmpty()) display += " ";
+        display += latestPartial;
+
+        notesInput.setText(display);
+        notesInput.setSelection(notesInput.getText().length());
+
+        if (pen != null) {
+            pen.setText("✒  Writing: " + phrase);
+            animatePen();
+        }
+    }
+
+    private void commitSpeechResult(Bundle b) {
+        String phrase = getRecognizedPhrase(b);
+        if (notesInput == null) return;
+
+        if (phrase.isEmpty()) {
+            latestPartial = "";
             return;
         }
 
-        // Partial results replace the previous partial phrase.
-        String existing = notesInput.getText().toString();
-        String separator = existing.isEmpty() ? "" : " ";
-        notesInput.setText(existing + separator + phrase);
+        if (phrase.equalsIgnoreCase("new topic")
+                || phrase.equalsIgnoreCase("new topic.")) {
+            String updated = speechBaseText;
+            if (!updated.isEmpty()) updated += "\n\n";
+            updated += "— NEW TOPIC —\n";
+            speechBaseText = updated;
+            latestPartial = "";
+            notesInput.setText(speechBaseText);
+            notesInput.setSelection(notesInput.getText().length());
+            if (topicInput != null) topicInput.setText("");
+            if (status != null) status.setText("New topic detected");
+            if (pen != null) pen.setText("✒  New topic started");
+            return;
+        }
+
+        if (!speechBaseText.isEmpty()
+                && !Character.isWhitespace(speechBaseText.charAt(
+                    speechBaseText.length() - 1))) {
+            speechBaseText += " ";
+        }
+        speechBaseText += phrase;
+        latestPartial = "";
+
+        notesInput.setText(speechBaseText);
         notesInput.setSelection(notesInput.getText().length());
+
+        if (pen != null) {
+            pen.setText("✒  Words added to notebook");
+            pen.clearAnimation();
+        }
     }
 
     private void animatePen() {
         if (pen == null) return;
 
+        pen.clearAnimation();
         RotateAnimation a = new RotateAnimation(
             -8, 8,
             Animation.RELATIVE_TO_SELF, .5f,
@@ -527,13 +669,22 @@ public class MainActivity extends Activity {
     }
 
     private void stopSpeech() {
+        listening = false;
+
+        if (restartSpeechRunnable != null) {
+            speechHandler.removeCallbacks(restartSpeechRunnable);
+            restartSpeechRunnable = null;
+        }
+
         if (speechRecognizer != null) {
             try {
-                speechRecognizer.stopListening();
+                speechRecognizer.cancel();
                 speechRecognizer.destroy();
             } catch (Exception ignored) {}
             speechRecognizer = null;
         }
+
+        latestPartial = "";
 
         if (pen != null) {
             pen.clearAnimation();
@@ -578,7 +729,10 @@ public class MainActivity extends Activity {
 
         try {
             File dir = new File(getExternalFilesDir(null), "recordings");
-            if (!dir.exists()) dir.mkdirs();
+            if (!dir.exists() && !dir.mkdirs()) {
+                toast("Could not create recordings folder");
+                return;
+            }
 
             String stamp = new SimpleDateFormat(
                 "yyyyMMdd_HHmmss", Locale.US).format(new Date());
@@ -606,6 +760,7 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             toast("Could not start recording: " + e.getMessage());
             releaseRecorder();
+            recording = false;
         }
     }
 
@@ -689,7 +844,9 @@ public class MainActivity extends Activity {
         }
 
         if (player != null) {
-            player.release();
+            try {
+                player.release();
+            } catch (Exception ignored) {}
             player = null;
         }
 
