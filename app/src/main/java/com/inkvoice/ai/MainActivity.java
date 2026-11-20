@@ -1,3 +1,4 @@
+
 package com.inkvoice.ai;
 
 import android.app.Activity;
@@ -10,7 +11,6 @@ import android.content.Intent;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.RecognitionListener;
-import android.media.MediaRecorder;
 import android.media.MediaPlayer;
 import android.view.Gravity;
 import android.view.View;
@@ -43,16 +43,13 @@ public class MainActivity extends Activity {
     private TextView status, pen;
     private LinearLayout content;
 
-    private MediaRecorder recorder;
     private MediaPlayer player;
     private SpeechRecognizer speechRecognizer;
-    private File currentAudio;
 
     private boolean recording = false;
     private boolean lightTheme = false;
     private boolean listening = false;
 
-    // Text already confirmed by speech recognition and the current changing phrase.
     private String speechBaseText = "";
     private String latestPartial = "";
 
@@ -500,7 +497,6 @@ public class MainActivity extends Activity {
                         pen.setText("✒  Waiting for speech...");
                     }
 
-                    // These errors commonly occur between spoken phrases.
                     if (error == SpeechRecognizer.ERROR_NO_MATCH
                             || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
                             || error == SpeechRecognizer.ERROR_NETWORK
@@ -714,11 +710,8 @@ public class MainActivity extends Activity {
         toast("Notebook saved on this phone");
     }
 
+    // Recording is handled by RecordingService, not by this Activity.
     private void startRecording() {
-        if (recording) {
-            toast("Recording is already running");
-            return;
-        }
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -728,71 +721,51 @@ public class MainActivity extends Activity {
         }
 
         try {
-            File dir = new File(getExternalFilesDir(null), "recordings");
-            if (!dir.exists() && !dir.mkdirs()) {
-                toast("Could not create recordings folder");
-                return;
+            Intent serviceIntent =
+                new Intent(this, RecordingService.class);
+
+            serviceIntent.setAction(RecordingService.ACTION_START);
+
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
             }
 
-            String stamp = new SimpleDateFormat(
-                "yyyyMMdd_HHmmss", Locale.US).format(new Date());
-
-            currentAudio = new File(dir,
-                mode.replace(" ", "_") + "_" + stamp + ".m4a");
-
-            recorder = new MediaRecorder();
-            recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
-            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-            recorder.setAudioEncodingBitRate(96000);
-            recorder.setAudioSamplingRate(44100);
-            recorder.setOutputFile(currentAudio.getAbsolutePath());
-
-            recorder.prepare();
-            recorder.start();
             recording = true;
 
-            if (status != null)
+            if (status != null) {
                 status.setText("Recording audio • " + mode);
+            }
 
-            toast("Recording started");
+            toast("Recording service started");
 
         } catch (Exception e) {
-            toast("Could not start recording: " + e.getMessage());
-            releaseRecorder();
             recording = false;
+            toast("Could not start recording: " + e.getMessage());
         }
     }
 
     private void stopRecording() {
-        if (!recording) {
-            toast("No recording is running");
-            return;
-        }
+
+        Intent serviceIntent =
+            new Intent(this, RecordingService.class);
+
+        serviceIntent.setAction(RecordingService.ACTION_STOP);
 
         try {
-            recorder.stop();
-            toast("Recording saved");
+            startService(serviceIntent);
         } catch (Exception e) {
-            toast("Recording was too short to save");
-            if (currentAudio != null) currentAudio.delete();
+            toast("Could not stop recording: " + e.getMessage());
         }
 
-        releaseRecorder();
         recording = false;
 
-        if (status != null)
+        if (status != null) {
             status.setText("Ready • " + mode);
-    }
-
-    private void releaseRecorder() {
-        if (recorder != null) {
-            try {
-                recorder.reset();
-                recorder.release();
-            } catch (Exception ignored) {}
-            recorder = null;
         }
+
+        toast("Recording stop requested");
     }
 
     private void playFile(File f) {
@@ -837,11 +810,10 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        stopSpeech();
+        // Do not stop RecordingService here.
+        // It must be able to continue recording after this screen closes.
 
-        if (recording) {
-            stopRecording();
-        }
+        stopSpeech();
 
         if (player != null) {
             try {
